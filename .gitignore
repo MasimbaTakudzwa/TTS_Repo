@@ -1,0 +1,25 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+tts-venv-311/
+.venv/
+venv/
+
+# Audio files
+*.wav
+*.mp3
+
+# Test files
+test.wav
+cloned.wav
+my_voice.wav
+my_voice.mp3
+
+# Development/testing scripts
+main_free.py
+read.py
+tts_pipeline_free.py
