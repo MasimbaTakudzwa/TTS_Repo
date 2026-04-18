@@ -19,7 +19,3 @@ cloned.wav
 my_voice.wav
 my_voice.mp3
 
-# Development/testing scripts
-main_free.py
-read.py
-tts_pipeline_free.py
