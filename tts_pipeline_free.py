@@ -1,42 +1,59 @@
 """
 tts_pipeline_free.py
 --------------------
-Completely FREE, local text-to-speech pipeline using Coqui XTTS v2.
+Enhanced local text-to-speech pipeline using Coqui XTTS v2 (idiap fork).
+
+Optimizations over the base version:
+  - Reference audio is resampled to XTTS's native 24kHz, silence-trimmed,
+    and loudness-normalized for consistent cloning quality.
+  - Accepts a list of reference clips to build a richer speaker embedding.
+  - Actual XTTS inference parameters (temperature, repetition_penalty,
+    top_k, top_p, length_penalty) are passed through correctly — the
+    previous version was setting VITS parameters that XTTS ignores.
+  - Chunk size tuned to XTTS's sweet spot (~180 words).
+  - Chunks are crossfaded on merge to eliminate audible seams.
+  - Text preprocessing expands abbreviations, spells out long numbers,
+    strips URLs/emails, and cleans punctuation for better prosody.
+  - Final output is peak-normalized.
 
 No API keys. No usage limits. Runs entirely on your machine.
-Supports voice cloning from a short reference audio clip (~6–30 seconds).
-
-Supports input as:
-  - Plain text string
-  - .txt / .md file
-  - PDF file (text extraction)
+Supports voice cloning from short reference audio (6–30 seconds each).
 
 Usage (as a module):
   from tts_pipeline_free import TTSPipeline
 
-  pipe = TTSPipeline(reference_audio="my_voice.wav")
+  pipe = TTSPipeline(reference_audio="my_voice.mp3")
   pipe.speak_text("Hello world", output_path="output.wav")
-  pipe.speak_file("document.pdf", output_path="output.wav")
+
+  # Multiple references for better cloning:
+  pipe = TTSPipeline(reference_audio=["calm.wav", "excited.wav", "neutral.wav"])
 
 Requirements:
-  pip install TTS pdfplumber
+  pip install coqui-tts pdfplumber
+  ffmpeg installed and on PATH
   (first run will auto-download the XTTS v2 model ~1.8GB)
 """
 
 import os
 import re
 import platform
+import subprocess
 import tempfile
 from pathlib import Path
+from typing import List, Optional, Union
 
 
 # ── Constants ─────────────────────────────────────────────────────────────
 
 SUPPORTED_TEXT_TYPES = {".txt", ".md"}
-SUPPORTED_PDF_TYPES  = {".pdf"}
+SUPPORTED_PDF_TYPES = {".pdf"}
 
-# XTTS can handle longer chunks than cloud APIs
-CHUNK_SIZE = 250  # words per chunk (XTTS works better with word-based splitting)
+# XTTS v2 operates natively at 24kHz
+XTTS_SAMPLE_RATE = 24000
+
+# XTTS's sweet spot is ~150-200 words per chunk. Beyond ~400 tokens
+# (roughly 200 words) the model loses coherence and produces artifacts.
+CHUNK_SIZE = 180
 
 DEFAULT_LANGUAGE = "en"
 
@@ -45,16 +62,8 @@ DEFAULT_LANGUAGE = "en"
 
 def detect_device() -> tuple[str, bool]:
     """
-    Automatically detect the best available compute device.
-
-    Returns
-    -------
-    (device_name, use_gpu) where device_name is one of:
-      "cuda"  — NVIDIA GPU (Windows/Linux, e.g. RTX 3060)
-      "mps"   — Apple Silicon GPU (M1/M2/M3 MacBook)
-      "cpu"   — fallback, no GPU available
-
-    The returned use_gpu bool is True for cuda and mps, False for cpu.
+    Pick the best available compute device.
+    Returns (device_name, use_gpu) where device_name ∈ {cuda, mps, cpu}.
     """
     try:
         import torch
@@ -71,11 +80,11 @@ def detect_device() -> tuple[str, bool]:
         print(f"[Device] Apple Silicon detected ({chip}) — using MPS")
         return "mps", True
 
-    print("[Device] No GPU detected — falling back to CPU (this will be slow for long text)")
+    print("[Device] No GPU detected — falling back to CPU (slow for long text)")
     return "cpu", False
 
 
-# ── Text helpers ──────────────────────────────────────────────────────────
+# ── File readers ──────────────────────────────────────────────────────────
 
 def extract_text_from_pdf(path: str) -> str:
     """Extract plain text from a PDF using pdfplumber."""
@@ -98,106 +107,204 @@ def read_text_file(path: str) -> str:
         return f.read()
 
 
-def convert_audio_to_wav(input_path: str) -> str:
-    """
-    Convert any audio file to a 22050Hz mono WAV suitable for XTTS.
-    Requires ffmpeg to be installed (brew install ffmpeg).
+# ── Reference audio preprocessing ─────────────────────────────────────────
 
-    Returns the path to the converted WAV file.
-    If the file is already a correctly formatted WAV, returns it unchanged.
-    """
-    import subprocess
-    path = Path(input_path)
-
-    if path.suffix.lower() == ".wav":
-        return input_path  # already WAV, pass through
-
-    out_path = str(path.with_suffix(".wav"))
-    print(f"[Audio] Converting {path.name} → {Path(out_path).name}...")
-
+def _check_ffmpeg() -> None:
+    """Raise a helpful error if ffmpeg isn't on PATH."""
     try:
         subprocess.run(
-            ["ffmpeg", "-y", "-i", input_path, "-ar", "22050", "-ac", "1", out_path],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            ["ffmpeg", "-version"],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        print(f"[Audio] Conversion complete: {out_path}")
-        return out_path
-    except FileNotFoundError:
+    except (FileNotFoundError, subprocess.CalledProcessError):
         raise RuntimeError(
-            "ffmpeg is not installed. Run: brew install ffmpeg\n"
-            "Then retry, or manually convert your file to WAV first."
+            "ffmpeg is required but not found on PATH. Install it:\n"
+            '  Windows: winget install "FFmpeg (Essentials Build)"\n'
+            "  macOS:   brew install ffmpeg\n"
+            "  Linux:   sudo apt install ffmpeg\n"
+            "Then restart your terminal."
         )
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"ffmpeg conversion failed for {input_path}: {e}")
 
 
-def preprocess_for_prosody(text: str) -> str:
+def preprocess_reference_audio(
+    input_path: str,
+    output_path: Optional[str] = None,
+    target_sr: int = XTTS_SAMPLE_RATE,
+    trim_silence: bool = True,
+    normalize_loudness: bool = True,
+) -> str:
     """
-    Improve TTS inflection by adjusting punctuation and sentence structure.
+    Prepare reference audio for optimal XTTS voice cloning.
 
-    XTTS reads punctuation as prosody cues — commas create short pauses,
-    periods drop the pitch, question marks raise it. This function adds
-    and cleans up punctuation so the model stresses the right parts.
+    Pipeline (all via ffmpeg):
+      1. Convert to mono
+      2. Resample to XTTS's native 24kHz (no upsampling inside the model)
+      3. Trim leading and trailing silence
+      4. EBU R128 loudness normalization to -16 LUFS (broadcast standard)
+
+    A good reference clip:
+      - 6-30 seconds of clean single-speaker speech
+      - Matches the register you want the clone to produce
+      - No background music, noise, or reverb
+      - Slight natural variation in pitch (not monotone)
     """
-    # Ensure sentences end with punctuation
-    text = re.sub(r'([a-zA-Z])(\s*\n)', r'\1.\2', text)
+    _check_ffmpeg()
+    input_path = str(Path(input_path).resolve())
 
-    # Add comma after common introductory words/phrases
-    intros = (
-        r'\b(However|Therefore|Moreover|Furthermore|Nevertheless|Consequently|'
-        r'Meanwhile|Instead|Otherwise|Additionally|Specifically|Notably|'
-        r'In fact|As a result|For example|For instance|In other words|'
-        r'That said|Even so|In addition|On the other hand|At the same time)'
-        r'(?!\s*,)'
-    )
-    text = re.sub(intros, r'\1,', text, flags=re.IGNORECASE)
+    if output_path is None:
+        # Write alongside the original with a clear suffix, so re-runs skip work
+        p = Path(input_path)
+        output_path = str(p.with_name(f"{p.stem}_xtts_ref.wav"))
 
-    # Add comma before coordinating conjunctions in long sentences
-    # (only when joining two clauses of 5+ words each)
-    text = re.sub(
-        r'(\w[\w\s]{20,}?)\s+(but|yet|so)\s+(\w)',
-        r'\1, \2 \3',
-        text,
-        flags=re.IGNORECASE
-    )
+    # Build filter chain
+    filters = []
+    if trim_silence:
+        # Trim up to 10 seconds of silence below -50dB at both ends,
+        # but preserve in-speech pauses.
+        filters.append(
+            "silenceremove=start_periods=1:start_duration=0.1:start_threshold=-50dB:"
+            "stop_periods=1:stop_duration=0.3:stop_threshold=-50dB:detection=peak"
+        )
+    if normalize_loudness:
+        # -16 LUFS is the YouTube/podcast standard; gives the clone consistent
+        # perceived volume regardless of how the source was recorded.
+        filters.append("loudnorm=I=-16:TP=-1.5:LRA=11")
 
-    # Replace " - " (em dash used as pause) with comma + space
-    text = re.sub(r'\s+[-–—]\s+', ', ', text)
+    cmd = ["ffmpeg", "-y", "-i", input_path, "-ar", str(target_sr), "-ac", "1"]
+    if filters:
+        cmd.extend(["-af", ",".join(filters)])
+    cmd.append(output_path)
 
-    # Clean up any double punctuation that may have been introduced
-    text = re.sub(r'([,.]){2,}', r'\1', text)
-    text = re.sub(r',\.', '.', text)
+    print(f"[Audio] Preprocessing reference: {Path(input_path).name} → {Path(output_path).name}")
 
-    # Collapse multiple spaces
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    except subprocess.CalledProcessError:
+        # Filters can fail on very short clips. Fall back to plain conversion.
+        print("[Audio] Filter chain failed — falling back to plain conversion")
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", input_path, "-ar", str(target_sr), "-ac", "1", output_path],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+    return output_path
+
+
+# ── Text preprocessing ────────────────────────────────────────────────────
+
+# Abbreviations XTTS mispronounces if read literally
+_ABBREVIATIONS = [
+    (r'\bMr\.', 'Mister'),
+    (r'\bMrs\.', 'Misses'),
+    (r'\bMs\.', 'Miss'),
+    (r'\bDr\.', 'Doctor'),
+    (r'\bSt\.', 'Saint'),
+    (r'\bFt\.', 'Fort'),
+    (r'\bJr\.', 'Junior'),
+    (r'\bSr\.', 'Senior'),
+    (r'\bProf\.', 'Professor'),
+    (r'\be\.g\.', 'for example,'),
+    (r'\bi\.e\.', 'that is,'),
+    (r'\betc\.', 'etcetera'),
+    (r'\bvs\.', 'versus'),
+    (r'\bNo\.(?=\s*\d)', 'Number'),
+    (r'\bapprox\.', 'approximately'),
+    (r'\bJan\.', 'January'),
+    (r'\bFeb\.', 'February'),
+    (r'\bAug\.', 'August'),
+    (r'\bSept?\.', 'September'),
+    (r'\bOct\.', 'October'),
+    (r'\bNov\.', 'November'),
+    (r'\bDec\.', 'December'),
+]
+
+
+def preprocess_text(text: str) -> str:
+    """
+    Normalize and prepare text for natural XTTS synthesis.
+
+    Handles the common things that sound obviously synthetic:
+      - Abbreviations (Dr., Mr., etc.)
+      - Large numbers (spelled out for cleaner pronunciation)
+      - URLs and email addresses (stripped — XTTS tries to spell them)
+      - Em/en dashes used as pauses (converted to commas)
+      - Stray double punctuation and whitespace
+    """
+    # Whitespace
+    text = re.sub(r'\r\n', '\n', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = re.sub(r'[ \t]+', ' ', text).strip()
+
+    # Kill URLs and emails before anything else
+    text = re.sub(r'https?://\S+', '', text)
+    text = re.sub(r'www\.\S+', '', text)
+    text = re.sub(r'\S+@\S+\.\S+', '', text)
+
+    # Expand abbreviations
+    for pattern, replacement in _ABBREVIATIONS:
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+
+    # Spell out numbers of 4+ digits (shorter numbers XTTS handles fine)
+    try:
+        import inflect
+        engine = inflect.engine()
+
+        def _num_to_words(match: re.Match) -> str:
+            raw = match.group(0).replace(',', '')
+            try:
+                return engine.number_to_words(int(raw), andword='')
+            except Exception:
+                return match.group(0)
+
+        text = re.sub(r'\b\d{1,3}(?:,\d{3})+\b', _num_to_words, text)  # 1,000,000
+        text = re.sub(r'\b\d{4,}\b', _num_to_words, text)              # 1000, 2025
+    except ImportError:
+        pass
+
+    # Ensure line-ending letters have terminal punctuation (prevents run-ons)
+    text = re.sub(r'([A-Za-z0-9])(\s*\n)', r'\1.\2', text)
+
+    # Em-dash / en-dash as pause → comma
+    text = re.sub(r'\s*[—–]\s*', ', ', text)
+    # Hyphen as pause (with spaces around it) → comma
+    text = re.sub(r'(\w)\s+-\s+(\w)', r'\1, \2', text)
+
+    # Cleanup: runs of punctuation, comma-period sequences, extra spaces
+    text = re.sub(r'([,.!?]){2,}', r'\1', text)
+    text = re.sub(r',\s*\.', '.', text)
+    text = re.sub(r'\.\s*,', '.', text)
     text = re.sub(r' {2,}', ' ', text)
 
     return text.strip()
 
 
-def clean_text(text: str) -> str:
-    """Remove excessive whitespace and blank lines."""
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    text = re.sub(r'[ \t]+', ' ', text)
-    return text.strip()
-
-
-def chunk_by_words(text: str, chunk_size: int = CHUNK_SIZE) -> list[str]:
+def chunk_by_words(text: str, chunk_size: int = CHUNK_SIZE) -> List[str]:
     """
-    Split text into word-count-based chunks at sentence boundaries.
-    XTTS performs best with chunks of ~150-300 words.
+    Split text into chunks at sentence boundaries, preferring paragraph breaks.
+    Targets ~chunk_size words per chunk (XTTS sweet spot ≈ 180).
     """
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-    chunks, current_words, current = [], 0, []
+    paragraphs = text.split('\n\n')
+    chunks: List[str] = []
+    current: List[str] = []
+    current_words = 0
 
-    for sentence in sentences:
-        word_count = len(sentence.split())
-        if current_words + word_count > chunk_size and current:
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+        sentences = re.split(r'(?<=[.!?])\s+', para)
+        for sentence in sentences:
+            word_count = len(sentence.split())
+            # If adding this sentence would overflow AND we already have content, flush.
+            if current_words + word_count > chunk_size and current:
+                chunks.append(" ".join(current))
+                current, current_words = [], 0
+            current.append(sentence)
+            current_words += word_count
+        # At a paragraph boundary, flush if the current chunk is already substantial.
+        if current_words >= chunk_size * 0.6:
             chunks.append(" ".join(current))
             current, current_words = [], 0
-        current.append(sentence)
-        current_words += word_count
 
     if current:
         chunks.append(" ".join(current))
@@ -205,105 +312,172 @@ def chunk_by_words(text: str, chunk_size: int = CHUNK_SIZE) -> list[str]:
     return chunks
 
 
-def merge_wav_files(wav_paths: list[str], output_path: str) -> None:
-    """Concatenate multiple WAV files into one using wave module (stdlib)."""
-    import wave
+# ── WAV handling ──────────────────────────────────────────────────────────
 
-    with wave.open(wav_paths[0], 'rb') as first:
-        params = first.getparams()
+def merge_wav_files(
+    wav_paths: List[str],
+    output_path: str,
+    crossfade_ms: int = 30,
+    peak_normalize_db: float = -1.0,
+) -> None:
+    """
+    Concatenate WAV files with a short crossfade to smooth chunk seams,
+    then peak-normalize the final output.
+    """
+    import numpy as np
+    import soundfile as sf
 
-    with wave.open(output_path, 'wb') as out:
-        out.setparams(params)
-        for wav_path in wav_paths:
-            with wave.open(wav_path, 'rb') as wf:
-                out.writeframes(wf.readframes(wf.getnframes()))
+    segments = []
+    sr = None
+    for path in wav_paths:
+        data, rate = sf.read(path)
+        if data.ndim > 1:
+            data = data.mean(axis=1)  # downmix to mono defensively
+        if sr is None:
+            sr = rate
+        segments.append(data.astype(np.float32))
 
-    for wav_path in wav_paths:
-        os.remove(wav_path)
+    xf = max(1, int(crossfade_ms * sr / 1000))
+    fade_out = np.linspace(1.0, 0.0, xf, dtype=np.float32)
+    fade_in = np.linspace(0.0, 1.0, xf, dtype=np.float32)
+
+    merged = segments[0].copy()
+    for seg in segments[1:]:
+        if len(merged) > xf and len(seg) > xf:
+            tail = merged[-xf:] * fade_out
+            head = seg[:xf] * fade_in
+            merged = np.concatenate([merged[:-xf], tail + head, seg[xf:]])
+        else:
+            merged = np.concatenate([merged, seg])
+
+    # Peak-normalize to just under 0dBFS to avoid clipping
+    peak = np.abs(merged).max()
+    if peak > 0:
+        target = 10 ** (peak_normalize_db / 20.0)
+        merged = merged * (target / peak)
+
+    sf.write(output_path, merged, sr)
+
+    # Clean up partial files
+    for path in wav_paths:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 # ── Main pipeline class ───────────────────────────────────────────────────
 
 class TTSPipeline:
     """
-    A free, local text-to-speech pipeline using Coqui XTTS v2.
+    Local voice-cloning TTS pipeline powered by XTTS v2.
 
-    Automatically detects whether to use:
-      - CUDA   (NVIDIA GPU on Windows/Linux — e.g. RTX 3060)
-      - MPS    (Apple Silicon on macOS — e.g. M3 MacBook)
-      - CPU    (fallback if no GPU is available)
+    Device is auto-detected: CUDA (NVIDIA) → MPS (Apple) → CPU.
 
     Parameters
     ----------
-    reference_audio : str
-        Path to a WAV file of the voice you want to clone.
-        Should be 6–30 seconds of clear speech, minimal background noise.
-        If None, uses the XTTS default voice.
+    reference_audio : str | Path | list of str/Path | None
+        One or more reference clips of the target voice (6–30s each).
+        Providing 2-4 varied clips usually produces a better clone than
+        one long clip. Any format ffmpeg can read. None → default voice.
     language : str
-        Language code. Default: 'en'. XTTS supports 17 languages including
-        es, fr, de, zh, ja, hi, ar, pt, pl, and more.
+        XTTS language code. Default: 'en'. See list_languages().
     force_cpu : bool
-        Set to True to skip GPU detection and run on CPU only.
-        Useful for debugging or low-VRAM situations.
-    temperature : float
-        Controls expressiveness and variation in the output.
-        Range: 0.1 – 1.0. Default: 0.75.
-        Lower (0.3–0.5) = more stable, consistent, but flatter.
-        Higher (0.7–0.9) = more expressive and natural, slight randomness.
-    repetition_penalty : float
-        Discourages the model from repeating the same sounds/patterns.
-        Default: 5.0. Increase (up to 10.0) if output sounds loopy or stuck.
-    speed : float
-        Speaking speed multiplier. Default: 1.0.
-        0.85 = slightly slower and more deliberate (often sounds more natural).
-        1.15 = slightly faster.
-    top_p : float
-        Nucleus sampling threshold. Default: 0.85.
-        Lower = safer/more predictable. Higher = more varied.
+        Skip GPU detection.
+    temperature : float (0.1–1.0, default 0.75)
+        Expressiveness. Lower = flatter/stabler. Higher = more varied but
+        risks occasional weird pronunciations.
+    repetition_penalty : float (default 5.0)
+        Discourages the model from looping. Raise to 7-10 if the output
+        sounds stuck, gets stammery, or repeats phonemes.
+    top_k : int (default 50)
+        Sampling diversity. 30-70 is a sensible range.
+    top_p : float (default 0.85)
+        Nucleus sampling. Lower = safer choices, higher = more variety.
+    length_penalty : float (default 1.0)
+        >1 favors longer outputs, <1 favors shorter.
+    speed : float (default 1.0)
+        Playback speed. 0.9 often sounds more natural/deliberate than 1.0.
+    preprocess_reference : bool (default True)
+        Apply silence trimming and loudness normalization to reference audio.
+    preprocess_text_input : bool (default True)
+        Apply abbreviation/number/URL cleanup to input text.
     """
 
     def __init__(
         self,
-        reference_audio: str = None,
+        reference_audio: Union[str, Path, List[Union[str, Path]], None] = None,
         language: str = DEFAULT_LANGUAGE,
         force_cpu: bool = False,
-        temperature: float = 0.75,
+        temperature: float = 0.55,
         repetition_penalty: float = 5.0,
-        speed: float = 1.0,
+        top_k: int = 50,
         top_p: float = 0.85,
+        length_penalty: float = 1.0,
+        speed: float = 1.3,
+        preprocess_reference: bool = True,
+        preprocess_text_input: bool = True,
     ):
         self.language = language
         self.temperature = temperature
         self.repetition_penalty = repetition_penalty
-        self.speed = speed
+        self.top_k = top_k
         self.top_p = top_p
-        self._model = None  # lazy-load on first use
+        self.length_penalty = length_penalty
+        self.speed = speed
+        self.preprocess_text_input = preprocess_text_input
+        self._model = None
 
         if force_cpu:
-            self.device = "cpu"
-            self.use_gpu = False
+            self.device, self.use_gpu = "cpu", False
             print("[Device] CPU mode forced.")
         else:
             self.device, self.use_gpu = detect_device()
 
-        if reference_audio:
-            if not Path(reference_audio).exists():
-                raise FileNotFoundError(f"Reference audio not found: {reference_audio}")
-            # Auto-convert to WAV if needed (MP3, M4A, etc.)
-            self.reference_audio = convert_audio_to_wav(reference_audio)
+        self.reference_audio = self._resolve_reference(reference_audio, preprocess_reference)
+
+    # ── Reference resolution ──────────────────────────────────────────────
+
+    def _resolve_reference(
+        self,
+        reference_audio: Union[str, Path, List, None],
+        preprocess: bool,
+    ) -> Union[str, List[str], None]:
+        if reference_audio is None:
+            return None
+
+        # Normalize to list
+        if isinstance(reference_audio, (str, Path)):
+            refs = [str(reference_audio)]
         else:
-            self.reference_audio = None
+            refs = [str(r) for r in reference_audio]
+
+        processed = []
+        for ref in refs:
+            if not Path(ref).exists():
+                raise FileNotFoundError(f"Reference audio not found: {ref}")
+            if preprocess:
+                processed.append(preprocess_reference_audio(ref))
+            else:
+                # Still need a WAV for XTTS
+                _check_ffmpeg()
+                p = Path(ref)
+                if p.suffix.lower() == ".wav":
+                    processed.append(ref)
+                else:
+                    out = str(p.with_suffix(".wav"))
+                    subprocess.run(
+                        ["ffmpeg", "-y", "-i", ref, "-ar", str(XTTS_SAMPLE_RATE), "-ac", "1", out],
+                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+                    processed.append(out)
+
+        # XTTS accepts either a single path or a list
+        return processed if len(processed) > 1 else processed[0]
+
+    # ── Model loading ─────────────────────────────────────────────────────
 
     def _load_model(self):
-        """
-        Lazy-load the XTTS model (downloads ~1.8GB on first run).
-
-        Device handling:
-          - CUDA: pass gpu=True — Coqui handles this natively
-          - MPS:  pass gpu=False, then manually move the model to MPS device
-                  (Coqui's gpu flag only covers CUDA, so MPS needs a manual push)
-          - CPU:  pass gpu=False
-        """
         if self._model is not None:
             return
 
@@ -311,76 +485,45 @@ class TTSPipeline:
             from TTS.api import TTS
         except ImportError:
             raise ImportError(
-                "Coqui TTS is not installed. Run:\n"
-                "  pip install TTS\n"
-                "Note: this will also install PyTorch if not already present."
+                "coqui-tts is not installed. Run:\n"
+                "  pip install coqui-tts\n"
+                "Note: install PyTorch separately first."
             )
 
-        print("[TTS] Loading XTTS v2 model (first run downloads ~1.8GB)...")
+        print("[TTS] Loading XTTS v2 (first run downloads ~1.8GB)...")
 
         if self.device == "cuda":
-            # CUDA: Coqui handles this natively with gpu=True
             self._model = TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=True)
-
-        elif self.device == "mps":
-            # XTTS v2 has a known incompatibility with MPS during inference —
-            # the transformers attention mask step fails on the MPS backend.
-            # On M-series Macs we run on CPU instead, which is still fast
-            # thanks to Apple Silicon's unified memory architecture.
-            print("[Device] MPS detected but XTTS inference is CPU-only on Apple Silicon (still fast on M-series)")
-            self._model = TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=False)
-
         else:
-            # CPU fallback
+            # XTTS inference on MPS is broken in practice — stay on CPU on Mac
+            if self.device == "mps":
+                print("[Device] Using CPU for XTTS inference (MPS has known XTTS issues)")
             self._model = TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=False)
 
         print("[TTS] Model loaded.")
 
-    # ── Public methods ────────────────────────────────────────────────────
+    # ── Public API ────────────────────────────────────────────────────────
 
     def speak_text(self, text: str, output_path: str = "output.wav") -> str:
-        """
-        Convert a plain text string to speech and save as a WAV file.
-
-        Parameters
-        ----------
-        text        : The text to speak.
-        output_path : Where to save the audio. Use .wav extension.
-
-        Returns
-        -------
-        The path to the saved audio file.
-        """
+        """Synthesize a string to a WAV file."""
         self._load_model()
-        text = clean_text(text)
-        text = preprocess_for_prosody(text)
+
+        if self.preprocess_text_input:
+            text = preprocess_text(text)
         print(f"[TTS] Processing {len(text):,} characters...")
 
         chunks = chunk_by_words(text)
-        print(f"[TTS] Split into {len(chunks)} chunk(s).")
+        print(f"[TTS] Split into {len(chunks)} chunk(s) (target ~{CHUNK_SIZE} words each).")
 
         return self._generate_and_save(chunks, output_path)
 
-    def speak_file(self, file_path: str, output_path: str = None) -> str:
-        """
-        Convert a text file or PDF to speech.
-
-        Parameters
-        ----------
-        file_path   : Path to a .txt, .md, or .pdf file.
-        output_path : Where to save the audio. Defaults to input filename + .wav
-
-        Returns
-        -------
-        The path to the saved audio file.
-        """
+    def speak_file(self, file_path: str, output_path: Optional[str] = None) -> str:
+        """Synthesize a .txt / .md / .pdf file to a WAV file."""
         path = Path(file_path)
-
         if not path.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
 
         suffix = path.suffix.lower()
-
         if suffix in SUPPORTED_PDF_TYPES:
             print(f"[TTS] Extracting text from PDF: {path.name}")
             text = extract_text_from_pdf(str(path))
@@ -395,57 +538,55 @@ class TTSPipeline:
 
         if not output_path:
             output_path = str(path.with_suffix(".wav"))
-
         return self.speak_text(text, output_path)
 
-    def list_languages(self) -> list[str]:
-        """Print languages supported by XTTS v2."""
+    def list_languages(self) -> List[str]:
         langs = [
             "en", "es", "fr", "de", "it", "pt", "pl", "tr",
-            "ru", "nl", "cs", "ar", "zh-cn", "ja", "hu", "ko", "hi"
+            "ru", "nl", "cs", "ar", "zh-cn", "ja", "hu", "ko", "hi",
         ]
         print("Supported languages:", ", ".join(langs))
         return langs
 
-    # ── Internal helpers ──────────────────────────────────────────────────
+    # ── Internals ─────────────────────────────────────────────────────────
 
-    def _generate_and_save(self, chunks: list[str], output_path: str) -> str:
-        """Generate audio for each chunk, then merge into a single file."""
+    def _generate_and_save(self, chunks: List[str], output_path: str) -> str:
         if len(chunks) == 1:
             self._tts_to_file(chunks[0], output_path)
         else:
             temp_paths = []
             for i, chunk in enumerate(chunks):
-                print(f"[TTS] Generating chunk {i+1}/{len(chunks)}...")
-                temp_path = output_path + f".part{i}.wav"
-                self._tts_to_file(chunk, temp_path)
-                temp_paths.append(temp_path)
-
-            print(f"[TTS] Merging {len(chunks)} chunks...")
+                print(f"[TTS] Generating chunk {i + 1}/{len(chunks)}...")
+                temp_paths.append(self._tts_to_file(chunk, f"{output_path}.part{i}.wav"))
+            print(f"[TTS] Merging {len(chunks)} chunks with crossfade...")
             merge_wav_files(temp_paths, output_path)
 
         print(f"[TTS] Saved to: {output_path}")
         return output_path
 
-    def _tts_to_file(self, text: str, output_path: str) -> None:
-        """Run XTTS inference for a single chunk."""
+    def _tts_to_file(self, text: str, output_path: str) -> str:
+        """Run XTTS inference for a single chunk with full parameter control."""
         kwargs = dict(
             text=text,
             language=self.language,
             file_path=output_path,
+            # These flow through to XTTS's inference() method.
+            # In the previous version these were set as VITS-style attributes
+            # (inference_noise_scale, length_scale) which XTTS silently ignores.
+            temperature=self.temperature,
+            repetition_penalty=self.repetition_penalty,
+            top_k=self.top_k,
+            top_p=self.top_p,
+            length_penalty=self.length_penalty,
             speed=self.speed,
+            # We've already chunked intelligently; don't let Coqui re-split.
+            split_sentences=False,
         )
+
         if self.reference_audio:
             kwargs["speaker_wav"] = self.reference_audio
         else:
             kwargs["speaker"] = "Claribel Dervla"
 
-        # Pass expressiveness parameters directly to the underlying model
-        # for finer control over prosody and naturalness
-        try:
-            self._model.synthesizer.tts_model.inference_noise_scale = self.temperature
-            self._model.synthesizer.tts_model.length_scale = 1.0 / self.speed
-        except AttributeError:
-            pass  # not all model versions expose these directly
-
         self._model.tts_to_file(**kwargs)
+        return output_path
