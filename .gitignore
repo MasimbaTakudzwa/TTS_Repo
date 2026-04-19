@@ -12,6 +12,7 @@ venv/
 # Audio files
 *.wav
 *.mp3
+*.mp4
 
 # Test files
 test.wav
