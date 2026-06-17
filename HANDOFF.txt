@@ -1,0 +1,44 @@
+===================================================================
+ PROJECT HANDOFF - TextToSpeech
+ Generated 2026-06-17 during a backup-and-archive-to-external-drive pass.
+===================================================================
+
+WHAT THIS IS
+  Text-to-speech project (large model/audio assets are gitignored). Remote: TTS_Repo.
+
+GITHUB (primary backup - all branches pushed, working tree was clean at archive)
+  Remote: https://github.com/MasimbaTakudzwa/TTS_Repo.git
+
+RESTORE / RESUME WHERE I LEFT OFF
+  This folder was copied to the external drive and may have been removed
+  from the laptop to free space. To resume work:
+    git clone https://github.com/MasimbaTakudzwa/TTS_Repo.git TextToSpeech
+    cd TextToSpeech
+    python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+
+CLAUDE CODE SESSIONS (IMPORTANT)
+  Claude Code keys session history to the project's absolute path, which was:
+    /Users/simsbgang/DevProjects/Python_Projects.nosync/TextToSpeech
+  Moving or deleting this folder breaks automatic session continuity.
+  Transcripts live under ~/.claude/projects/ (encoded by that path).
+  To get context back: clone/restore to the SAME path (/Users/simsbgang/DevProjects/Python_Projects.nosync/TextToSpeech) before
+  reopening Claude Code; or start a fresh session and have Claude read this
+  HANDOFF.txt plus the recent commits below.
+
+BRANCHES AT ARCHIVE TIME (current branch: main)
+  main  | last commit 8 weeks ago
+
+RECENT WORK - last 15 commits on main
+  797e157  2026-04-19  added .mp4 to gitignore list
+  d0bbe73  2026-04-19  Code changes to read.py
+  7c34d2b  2026-04-18  Code changes and parameter fine tuning
+  71e0787  2026-04-18  pushing missed python files to repo
+  2c808d5  2026-04-18  added windows files
+  017ed18  2026-04-18  Initial commit
+
+UNCOMMITTED AT ARCHIVE (kept local on purpose - on the drive copy only, NOT on GitHub)
+  ?? HANDOFF.txt
+
+DRIVE ARCHIVE LOCATION
+  /Volumes/Untitled/DevProjects-backup/Python_Projects.nosync/TextToSpeech
+===================================================================
