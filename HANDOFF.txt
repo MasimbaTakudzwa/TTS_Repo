@@ -1,44 +1,382 @@
 ===================================================================
- PROJECT HANDOFF - TextToSpeech
- Generated 2026-06-17 during a backup-and-archive-to-external-drive pass.
+ ENGINEERING HANDOFF - TextToSpeech (TTS voice-cloning pipeline)
+ Author: Masimba (MasimbaTakudzwa)
+ Handoff written: 2026-06-17  (project being archived off the laptop)
+ Canonical path: /Users/simsbgang/DevProjects/Python_Projects.nosync/TextToSpeech
+ GitHub:  https://github.com/MasimbaTakudzwa/TTS_Repo.git  (branch: main)
+ Drive backup: /Volumes/Untitled/DevProjects-backup/Python_Projects.nosync/TextToSpeech
+
+ READ THIS FIRST IF YOU ARE A FRESH CLAUDE SESSION WITH NO MEMORY.
+ This single file is the source of truth for the project's state.
 ===================================================================
 
-WHAT THIS IS
-  Text-to-speech project (large model/audio assets are gitignored). Remote: TTS_Repo.
 
-GITHUB (primary backup - all branches pushed, working tree was clean at archive)
-  Remote: https://github.com/MasimbaTakudzwa/TTS_Repo.git
+-------------------------------------------------------------------
+1. WHAT THIS IS
+-------------------------------------------------------------------
+  - A local, offline text-to-speech pipeline with VOICE CLONING.
+  - It turns a text string, a .txt/.md file, or a PDF into a spoken
+    WAV file, optionally in a cloned voice built from a short
+    reference recording (6-30s of clean speech).
+  - It is a LOCAL MODEL pipeline (NOT an API). The engine is Coqui
+    XTTS v2 (the maintained "coqui-tts" fork). No API keys, no usage
+    limits, no internet required after the model is downloaded once.
+  - GOAL: a personal tool to read documents/notes aloud in Masimba's
+    own cloned voice. The repo also sketches a paid ElevenLabs API
+    alternative, but that path was never built (see section 6).
+  - Maturity: working personal-use script / hobby tool. It runs and
+    produces audio. It is NOT a packaged product, has no automated
+    tests, and the "test*.py" files are ad-hoc smoke scripts.
 
-RESTORE / RESUME WHERE I LEFT OFF
-  This folder was copied to the external drive and may have been removed
-  from the laptop to free space. To resume work:
-    git clone https://github.com/MasimbaTakudzwa/TTS_Repo.git TextToSpeech
-    cd TextToSpeech
-    python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
 
-CLAUDE CODE SESSIONS (IMPORTANT)
-  Claude Code keys session history to the project's absolute path, which was:
-    /Users/simsbgang/DevProjects/Python_Projects.nosync/TextToSpeech
-  Moving or deleting this folder breaks automatic session continuity.
-  Transcripts live under ~/.claude/projects/ (encoded by that path).
-  To get context back: clone/restore to the SAME path (/Users/simsbgang/DevProjects/Python_Projects.nosync/TextToSpeech) before
-  reopening Claude Code; or start a fresh session and have Claude read this
-  HANDOFF.txt plus the recent commits below.
+-------------------------------------------------------------------
+2. TECH STACK & ARCHITECTURE
+-------------------------------------------------------------------
+  Language: Python (developed against Python 3.11; see venv note below)
 
-BRANCHES AT ARCHIVE TIME (current branch: main)
-  main  | last commit 8 weeks ago
+  Core libraries / models (verified against the working venv):
+    - coqui-tts (PyPI package name "TTS") 0.22.0  -> XTTS v2 model
+    - torch 2.5.1, torchaudio 2.5.1, torchvision 0.20.1
+    - pdfplumber           -> PDF text extraction
+    - soundfile + numpy    -> WAV merge / crossfade / peak-normalize
+    - inflect (optional)   -> spells out long numbers in preprocessing
+    - ffmpeg (system binary, must be on PATH) -> reference-audio prep
 
-RECENT WORK - last 15 commits on main
-  797e157  2026-04-19  added .mp4 to gitignore list
-  d0bbe73  2026-04-19  Code changes to read.py
-  7c34d2b  2026-04-18  Code changes and parameter fine tuning
-  71e0787  2026-04-18  pushing missed python files to repo
-  2c808d5  2026-04-18  added windows files
-  017ed18  2026-04-18  Initial commit
+  Model used: tts_models/multilingual/multi-dataset/xtts_v2
+    - ~1.8 GB. Auto-downloads to the Coqui cache on first synthesis.
+    - 17 languages (en, es, fr, de, it, pt, pl, tr, ru, nl, cs, ar,
+      zh-cn, ja, hu, ko, hi). Operates natively at 24 kHz.
 
-UNCOMMITTED AT ARCHIVE (kept local on purpose - on the drive copy only, NOT on GitHub)
-  ?? HANDOFF.txt
+  Directory layout / what lives where:
+    tts_pipeline_free.py   CORE. The whole pipeline lives here:
+                           device detection (CUDA > MPS > CPU),
+                           ffmpeg reference-audio preprocessing,
+                           text normalization, word-based chunking,
+                           XTTS inference, crossfade WAV merge,
+                           and the TTSPipeline class.
+    main_free.py           CLI entry point (argparse) wrapping
+                           TTSPipeline. This is the front door.
+    read.py                Ad-hoc script: the most recent real run.
+                           Clones from "lossless.mp4" with tuned
+                           params and writes "cloned.wav". This is
+                           effectively the "current experiment".
+    test.py                Smoke test: synth a sentence -> test.wav.
+    test2.py               Smoke test: load model only.
+    test3.py               torch/CUDA/MPS device check.
+    windowstest.py         torch/CUDA check (Windows machine variant).
+    README.md              User-facing usage docs (CLI + module API).
+                           NOTE: README references tts_pipeline.py and
+                           main.py (the paid ElevenLabs pair) which DO
+                           NOT EXIST in the repo. Only the _free files
+                           were ever built.
+    requirements.txt       SEE WARNING in section 6 - this file is
+                           mostly a pasted ChatGPT conversation, not a
+                           clean pip freeze. The real deps are two
+                           lines near the very end.
+    *.wav / *.mp3 / *.mp4 / *.mpeg   audio assets (see below).
+    tts-venv/              Python 3.13 venv (~424 MB) - ABANDONED.
+    tts-venv-311/          Python 3.11 venv (~1.2 GB) - THE WORKING ONE.
+    __pycache__/           compiled bytecode (ignore).
 
-DRIVE ARCHIVE LOCATION
-  /Volumes/Untitled/DevProjects-backup/Python_Projects.nosync/TextToSpeech
+  Audio / model assets and where they live:
+    - Audio reference + output files in the repo root are SMALL
+      (~17 MB total): my_voice.wav (7.3MB, gitignored), my_voice.mp3,
+      my_voice.mpeg, cloned.wav, test.wav, lossless.mp4, plus a
+      screen-recording .mp4.
+    - my_voice.mpeg and lossless.mp4 ARE tracked in git (committed
+      before/around the ignore rules) so they ARE on GitHub.
+      Everything else matching *.wav/*.mp3/*.mp4 is gitignored.
+    - The XTTS v2 MODEL WEIGHTS (~1.8 GB) are NOT in this folder and
+      NOT in the Coqui cache right now - they will re-download on the
+      first synthesis run. They are not committed and not backed up
+      as files; treat them as re-downloadable.
+    - The genuinely large, drive-only, NOT-on-GitHub artifacts are
+      the VIRTUAL ENVIRONMENTS (tts-venv-311 ~1.2 GB, tts-venv ~424 MB).
+      These are gitignored. A GitHub clone will NOT contain them; you
+      either copy them from the drive or recreate them (recreate is
+      cleaner - see section 7).
+
+  External services / APIs:
+    - NONE in the working pipeline. Fully local/offline after model
+      download. The ElevenLabs (paid API) path was never implemented.
+
+
+-------------------------------------------------------------------
+3. CURRENT STATE (honest)
+-------------------------------------------------------------------
+  WORKS:
+    - End-to-end synthesis via the free local pipeline: text/file/PDF
+      -> WAV, with voice cloning from a reference clip.
+    - CLI (main_free.py) and module API (TTSPipeline) both function.
+    - ffmpeg reference preprocessing (mono, 24kHz resample, silence
+      trim, EBU R128 loudnorm) with a plain-conversion fallback.
+    - Text preprocessing (abbreviations, long numbers via inflect,
+      URL/email stripping, dash->comma, punctuation cleanup).
+    - Word-based chunking (~180 words) with crossfaded WAV merge and
+      final peak normalization.
+    - Device auto-detect. In practice this runs on CPU on the Mac:
+      the code DELIBERATELY forces CPU even when MPS is detected
+      because XTTS inference on Apple MPS is broken/unreliable
+      (see _load_model in tts_pipeline_free.py). CPU is slow for long
+      text. The 3060 RTX (CUDA) laptop is the fast path.
+
+  IN PROGRESS / TUNING:
+    - Voice-clone QUALITY tuning. The active experiment is read.py,
+      cloning from lossless.mp4 -> cloned.wav with hand-tuned params
+      (temperature=0.87, repetition_penalty=7.0, top_p=0.85,
+      speed=1.09). These call-site overrides differ from the class
+      defaults, which is the open question (see section 5).
+
+  STUBBED / MISSING:
+    - Paid ElevenLabs pipeline (tts_pipeline.py / main.py): referenced
+      in README and requirements comments, never written.
+    - No automated tests, no CI, no packaging (no pyproject/setup).
+    - requirements.txt is not a usable dependency manifest (section 6).
+
+  BUILD/TEST HEALTH:
+    - No build system, no test suite to report on. Health = "the
+      author's scripts run on the 3.11 venv." Working tree was clean
+      and pushed to origin/main at archive time.
+
+
+-------------------------------------------------------------------
+4. RECENT WORK (narrative, branch: main)
+-------------------------------------------------------------------
+  Full history is short - only 7 commits total. Newest first:
+
+    1f91c18  2026-06-17  docs: add HANDOFF.txt (this file's first,
+                         sparser version - now replaced by this one)
+    797e157  2026-04-19  added .mp4 to gitignore list
+    d0bbe73  2026-04-19  Code changes to read.py
+    7c34d2b  2026-04-18  Code changes and parameter fine tuning
+    71e0787  2026-04-18  pushing missed python files to repo
+    2c808d5  2026-04-18  added windows files
+    017ed18  2026-04-18  Initial commit
+
+  Narrative: the project was built in a tight burst over 16-19 April
+  2026. Initial commit landed the free pipeline + CLI + README. Then
+  the Windows device-check files were added (work was happening on
+  both the Mac and the 3060 RTX Windows laptop). The last real code
+  work (7c34d2b "parameter fine tuning" and d0bbe73 "Code changes to
+  read.py") was iterating on clone quality via read.py's XTTS params,
+  followed by housekeeping (.mp4 added to .gitignore). After a ~2
+  month gap, the 2026-06-17 commit added the original handoff doc as
+  part of this archive-to-drive pass.
+
+  UNCOMMITTED CHANGES at archive time: working tree is CLEAN
+  (this HANDOFF.txt overwrite is the only pending change). Nothing
+  else uncommitted. Everything code-wise is on GitHub.
+
+
+-------------------------------------------------------------------
+5. WHERE TO PICK UP  (MOST IMPORTANT)
+-------------------------------------------------------------------
+  The project is mid-way through ONE thing: getting the voice clone
+  to sound good. Pick up there.
+
+  SINGLE MOST IMPORTANT NEXT STEP:
+    Resolve the parameter mismatch between the TTSPipeline class
+    defaults and the read.py experiment, then settle on one good
+    clone-quality profile.
+      - tts_pipeline_free.py class defaults:
+            temperature=0.55, speed=1.3
+        These defaults are odd: speed=1.3 is fast (the docstring even
+        says ~0.9 sounds more natural), and 0.55 is quite flat. They
+        look like leftover experiment values, NOT a considered default.
+      - read.py call site (the last thing actually tuned):
+            temperature=0.87, repetition_penalty=7.0, speed=1.09
+        These are the values Masimba last judged best.
+    ACTION: listen to cloned.wav, decide on a final profile, and push
+    those values into the TTSPipeline __init__ defaults so the CLI and
+    module API produce the good result by default.
+
+  CONCRETE NEXT STEPS:
+    1. Recreate the env and restore assets (section 7), then run:
+         python read.py
+       Confirm it still produces a clean cloned.wav from lossless.mp4.
+    2. Improve the reference clip: lossless.mp4 / my_voice.* are the
+       current references. Try feeding the longer/cleaner my_voice.wav
+       (7.3MB), or a LIST of 2-4 short varied clips - the pipeline
+       supports a list for a richer speaker embedding (see
+       _resolve_reference and the reference_audio param).
+    3. Bake the chosen params into tts_pipeline_free.py defaults.
+    4. Fix the README/repo mismatch: EITHER build the ElevenLabs
+       tts_pipeline.py + main.py that the README promises, OR edit the
+       README to drop the paid path and the non-existent files.
+    5. Replace requirements.txt with a real manifest (section 6).
+
+  FILES TO CONTINUE IN (in priority order):
+    - read.py                (the live experiment / quickest feedback loop)
+    - tts_pipeline_free.py   (where to bake in final defaults; the engine)
+    - main_free.py           (CLI; expose tuning flags if desired)
+    - README.md / requirements.txt (cleanup)
+
+  WHAT "DONE" LOOKS LIKE:
+    - `python main_free.py --text "..." --ref <best_ref>` produces a
+      clone that sounds like Masimba on the first try, no per-run param
+      fiddling.
+    - README matches what actually exists in the repo.
+    - requirements.txt installs cleanly into a fresh venv.
+
+
+-------------------------------------------------------------------
+6. KNOWN ISSUES / TODOS / CAVEATS
+-------------------------------------------------------------------
+  - requirements.txt IS BROKEN AS A MANIFEST. It is mostly a pasted
+    ChatGPT conversation (an Upwork cover-letter draft, etc.). The
+    ONLY real dependency lines are near the very end:
+         TTS>=0.22.0          # Coqui XTTS v2
+         pdfplumber>=0.10.0   # PDF text extraction
+    Do NOT `pip install -r requirements.txt` expecting it to work
+    cleanly - it will choke. Install the deps by hand (section 7) and
+    regenerate this file from the working venv.
+
+  - README mentions tts_pipeline.py (ElevenLabs core) and main.py
+    (paid CLI). Neither file exists. Only the *_free.py pair is real.
+
+  - Apple Silicon / MPS: XTTS inference on MPS is unreliable, so the
+    code forces CPU on Mac even when a GPU is detected. CPU synthesis
+    is slow for long documents. For speed, use the 3060 RTX (CUDA)
+    Windows laptop.
+
+  - The XTTS v2 model (~1.8 GB) is NOT cached locally right now. First
+    synthesis run will download it. Needs internet for that one time.
+    (Coqui may also prompt to accept the model license/CPML on first
+    run depending on version - run interactively the first time.)
+
+  - Two venvs exist; tts-venv (Python 3.13) is ABANDONED and has no
+    TTS installed (XTTS/coqui-tts does not support 3.13 well). Use /
+    recreate the 3.11 venv only. Both venvs' pyvenv.cfg still point at
+    the OLD path (~/Desktop/Python_Projects/...) from before the move
+    to DevProjects.nosync - another reason to recreate rather than
+    copy them.
+
+  - No TODO/FIXME markers exist in the source code (scanned - clean).
+    All the open items are captured here in this handoff.
+
+  - ffmpeg must be installed and on PATH (brew install ffmpeg). The
+    code raises a helpful error if it is missing.
+
+
+-------------------------------------------------------------------
+7. HOW TO RUN & DEVELOP
+-------------------------------------------------------------------
+  Prereqs: Python 3.11 (NOT 3.13), ffmpeg on PATH, internet for the
+  one-time ~1.8 GB model download.
+
+  Recommended: recreate the venv fresh (do NOT rely on the copied
+  venvs - their internal paths are stale, see section 6).
+
+    python3.11 -m venv tts-venv-311
+    source tts-venv-311/bin/activate
+    pip install --upgrade pip
+    pip install coqui-tts pdfplumber inflect soundfile numpy
+
+  (Pin to the known-good set if needed: coqui-tts==0.22.0,
+   torch==2.5.1, torchaudio==2.5.1. coqui-tts pulls torch in.)
+
+  Run the CLI:
+    python main_free.py --text "Hello, this is my cloned voice." --ref my_voice.wav
+    python main_free.py --file notes.txt --ref my_voice.wav --output notes.wav
+    python main_free.py --file document.pdf
+    python main_free.py --list-langs
+    python main_free.py --text "Hello" --cpu        (force CPU)
+
+  Run the active experiment:
+    python read.py            (clones lossless.mp4 -> cloned.wav)
+
+  Use as a module:
+    from tts_pipeline_free import TTSPipeline
+    pipe = TTSPipeline(reference_audio="my_voice.wav")
+    pipe.speak_text("Hello world", output_path="out.wav")
+
+  CRITICAL - large assets NOT on GitHub (drive-only):
+    A GitHub clone is INCOMPLETE. It does NOT include the virtual
+    environments (the multi-GB pieces). You must either:
+      (a) RECREATE the 3.11 venv with the pip commands above
+          (recommended - cleaner than copying stale-path venvs), OR
+      (b) copy them from the drive (see section 9), accepting that
+          their internal paths point at the old ~/Desktop location.
+    The XTTS model (~1.8 GB) is also not on GitHub and not on the
+    drive as files - it re-downloads on first run.
+    The reference audio my_voice.wav (best/largest, 7.3MB) is
+    gitignored and lives on the drive; lossless.mp4 and my_voice.mpeg
+    DID get tracked and ARE on GitHub.
+
+  Env vars / API keys:
+    - NONE required for the free local pipeline (it is fully offline).
+    - If the unbuilt ElevenLabs path is ever implemented, it would
+      need an ELEVENLABS_API_KEY env var. There is no such key today.
+      NEVER hardcode or print key values.
+
+
+-------------------------------------------------------------------
+8. GITHUB & BRANCHES
+-------------------------------------------------------------------
+  Remote (origin): https://github.com/MasimbaTakudzwa/TTS_Repo.git
+  Current / only branch: main  (origin/main, up to date, tree clean)
+  7 commits total.
+
+  What IS on GitHub: all .py source, README.md, .gitignore,
+  requirements.txt, and the two committed media files
+  (my_voice.mpeg, lossless.mp4).
+
+  What is GITIGNORED / NOT on GitHub (drive-only or re-downloadable):
+    - tts-venv-311/ and tts-venv/ virtual environments (the big stuff)
+    - my_voice.wav, my_voice.mp3, cloned.wav, test.wav, the screen-
+      recording .mp4, and any new *.wav/*.mp3/*.mp4 outputs
+    - __pycache__/, .DS_Store
+    - the XTTS v2 model weights (~1.8 GB, re-downloads on first run)
+  .gitignore rules: .DS_Store, __pycache__/, *.pyc/pyo, tts-venv-311/,
+  .venv/, venv/, *.wav, *.mp3, *.mp4, plus explicit test/clone files.
+
+
+-------------------------------------------------------------------
+9. RESTORE & CLAUDE CODE SESSIONS
+-------------------------------------------------------------------
+  CLAUDE CODE CONTINUITY (important):
+    Claude Code keys session history to the project's ABSOLUTE PATH:
+       /Users/simsbgang/DevProjects/Python_Projects.nosync/TextToSpeech
+    Transcripts live under ~/.claude/projects/ encoded by that path.
+    Moving or deleting this folder BREAKS automatic session continuity.
+    To get prior context back, restore to the EXACT SAME PATH above
+    before reopening Claude Code. Otherwise, start a fresh session and
+    have Claude read this HANDOFF.txt plus the recent commits.
+
+  A GITHUB CLONE ALONE IS INCOMPLETE:
+    The clone gives you code + README + two media files, but NOT the
+    multi-GB virtual environments and NOT the XTTS model. You must
+    recreate the venv (and the model re-downloads on first run).
+
+  FULL RESTORE (recommended path = clone + recreate venv):
+
+    git clone https://github.com/MasimbaTakudzwa/TTS_Repo.git "/Users/simsbgang/DevProjects/Python_Projects.nosync/TextToSpeech"
+    cd "/Users/simsbgang/DevProjects/Python_Projects.nosync/TextToSpeech"
+    python3.11 -m venv tts-venv-311
+    source tts-venv-311/bin/activate
+    pip install --upgrade pip
+    pip install coqui-tts pdfplumber inflect soundfile numpy
+
+  COPY DRIVE-ONLY ASSETS (the multi-GB pieces + gitignored audio):
+    Only needed if you want the exact venvs / original reference WAVs
+    rather than recreating. Run with the drive mounted at /Volumes/Untitled:
+
+    rsync -avh "/Volumes/Untitled/DevProjects-backup/Python_Projects.nosync/TextToSpeech/tts-venv-311/" "/Users/simsbgang/DevProjects/Python_Projects.nosync/TextToSpeech/tts-venv-311/"
+    rsync -avh "/Volumes/Untitled/DevProjects-backup/Python_Projects.nosync/TextToSpeech/my_voice.wav" "/Users/simsbgang/DevProjects/Python_Projects.nosync/TextToSpeech/"
+    rsync -avh "/Volumes/Untitled/DevProjects-backup/Python_Projects.nosync/TextToSpeech/cloned.wav" "/Users/simsbgang/DevProjects/Python_Projects.nosync/TextToSpeech/"
+
+    NOTE: copied venvs have stale internal paths (they point at the
+    old ~/Desktop/Python_Projects location). Recreating is cleaner.
+    NOTE: at the time this handoff was written the drive backup folder
+    did not exist yet - it is created during the archive pass this
+    handoff is part of. Verify the path is populated before relying
+    on the rsync commands above.
+
+  THEN verify:
+    source tts-venv-311/bin/activate
+    python test3.py     (device check)
+    python read.py      (full clone run -> cloned.wav; downloads model)
+
+===================================================================
+ END OF HANDOFF
 ===================================================================
